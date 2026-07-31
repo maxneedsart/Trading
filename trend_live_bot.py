@@ -47,6 +47,8 @@ MAX_NOTL_TOTAL = float(os.getenv("LIVE_MAX_NOTIONAL_TOTAL", "80"))  # total expo
 MAX_CONCURRENT = int(os.getenv("LIVE_MAX_CONCURRENT", "2"))
 DAILY_LOSS_STOP = float(os.getenv("LIVE_DAILY_LOSS_STOP", "0.25"))  # halt if equity down 25% vs day start
 POS_EPS        = float(os.getenv("LIVE_POS_EPS", "0"))             # treat |amt|<=eps as flat (0=exact)
+FEE            = float(os.getenv("LIVE_FEE_RATE", "0.0005"))        # taker fee for the paper simulation
+SIM_START_BAL  = float(os.getenv("LIVE_SIM_BAL", "0"))             # 0 = use the real balance at startup
 
 TAB   = os.getenv("LIVE_SHEET_TAB", "Live Trades")
 _HEAD = ["utc", "event", "asset", "side", "reason", "mark", "qty", "notional", "lev", "entry",
@@ -149,6 +151,135 @@ def _equity(balance, marks):
     return eq
 
 
+# ================= PAPER SIMULATION (DRY mode) =================
+# In DRY mode there are no real fills, so instead of re-reading the (empty) exchange position every
+# poll, we keep a VIRTUAL account: real prices, same trailing-stop + pyramid logic, tracked P&L and
+# projected equity -> so "Live Trades" shows realistic numbers of where the account would be.
+
+def _blank_sim():
+    return {"dir": 0, "qty": 0.0, "avg": 0.0, "margin": 0.0, "stop": None, "adds": 0, "block": 0}
+
+
+def _sim_equity(acct, snap):
+    eq = acct["cash"]
+    for a in ASSETS:
+        p = acct["pos"][a]
+        if p["dir"] != 0 and a in snap:
+            eq += p["margin"] + p["dir"] * p["qty"] * (snap[a]["mark"] - p["avg"])
+    return eq
+
+
+def _sim_open(acct, a, d, lev, mark, why, ws, snap):
+    sym = SYMBOL[a]
+    target = max(BET_USD * lev, bf.min_notional(sym))
+    qty = bf.qty_for_notional(sym, target, mark); notl = qty * mark
+    if notl <= 0 or notl < bf.min_notional(sym) or notl > MAX_NOTL_POS:
+        _log(f"[SIM] {a} skip size ${notl:.2f}"); return
+    margin = notl / lev; fee = notl * FEE
+    if acct["cash"] < margin + fee:
+        return
+    acct["cash"] -= (margin + fee); acct["fees"] += fee
+    sd = _stop_dist(lev); stop = mark * (1 - sd) if d > 0 else mark * (1 + sd)
+    acct["pos"][a] = {"dir": d, "qty": qty, "avg": mark, "margin": margin, "stop": stop, "adds": 0, "block": 0}
+    eq = _sim_equity(acct, snap)
+    _row(ws, "OPEN", a, "LONG" if d > 0 else "SHORT", why, mark, qty, notl, lev, mark, stop, 0, 0.0,
+         acct["realized"], acct["cash"], eq, "SIM")
+    _log(f"[SIM] {a} OPEN {'LONG' if d>0 else 'SHORT'} qty={qty} notl=${notl:.2f} stake=${margin:.2f} "
+         f"lev={lev:.1f}x stop={stop:.6f} | {why}")
+
+
+def _run_sim(ws, r):
+    keys = bool(os.getenv("BINANCE_API_KEY"))
+    try:
+        start = SIM_START_BAL or (bf.usdt_balance() if keys else 30.0) or 30.0
+    except Exception:
+        start = SIM_START_BAL or 30.0
+    acct = {"cash": start, "realized": 0.0, "fees": 0.0, "peak": start, "pos": {a: _blank_sim() for a in ASSETS}}
+    if r:
+        try:
+            saved = json.loads(r.get("trendlive:sim") or "{}")
+            if saved and "cash" in saved and "pos" in saved:
+                acct = saved
+                for a in ASSETS:
+                    acct["pos"].setdefault(a, _blank_sim())
+        except Exception:
+            pass
+    _log(f"SIM/paper mode (DRY_RUN) — projected account start ${acct['cash']:.2f}, {ASSETS}. "
+         f"No real orders; 'Live Trades' shows the simulated forecast.")
+    _tg(f"📊 TrendLive SIM (paper forecast) start ${acct['cash']:.2f} {ASSETS}")
+
+    while True:
+        try:
+            snap = {}
+            for a in ASSETS:
+                try:
+                    closes, _ = tp.daily_closes(a); sl = tp.signal_and_lev(closes); mark = bf.mark_price(SYMBOL[a])
+                except Exception as e:
+                    _log(f"{a} data error: {e}"); continue
+                if sl is None or not mark:
+                    continue
+                snap[a] = {"mark": mark, "sl": sl}
+                sig = sl["dir"]; lev = _clamp_lev(sl["lev"]); why = tp.reason_str(sl, mark)
+                p = acct["pos"][a]
+
+                # ---- manage an open sim position ----
+                if p["dir"] != 0:
+                    d = p["dir"]; fav = d * (mark / p["avg"] - 1.0)
+                    if fav >= TRAIL_BE:
+                        tr = mark * (1 - TRAIL_PCT) if d > 0 else mark * (1 + TRAIL_PCT)
+                        p["stop"] = max(p["stop"], p["avg"], tr) if d > 0 else min(p["stop"], p["avg"], tr)
+                    add_notl = BET_USD * TRAIL_ADDF * lev
+                    if (p["adds"] < TRAIL_ADDS and fav >= TRAIL_PYR * (p["adds"] + 1) and (sig == 0 or sig == d)
+                            and acct["cash"] >= BET_USD * TRAIL_ADDF * (1 + FEE)):
+                        addq = add_notl / mark; fee = add_notl * FEE
+                        tot = p["qty"] + addq
+                        p["avg"] = (p["avg"] * p["qty"] + mark * addq) / tot; p["qty"] = tot
+                        p["margin"] += BET_USD * TRAIL_ADDF; acct["cash"] -= (BET_USD * TRAIL_ADDF + fee)
+                        acct["fees"] += fee; p["adds"] += 1
+                        tr = mark * (1 - TRAIL_PCT) if d > 0 else mark * (1 + TRAIL_PCT)
+                        p["stop"] = max(p["stop"], tr) if d > 0 else min(p["stop"], tr)
+                        _log(f"[SIM] {a} PYRAMID add#{p['adds']} -> avg {p['avg']:.6f} stop {p['stop']:.6f}")
+                    stop_hit = (d > 0 and mark <= p["stop"]) or (d < 0 and mark >= p["stop"])
+                    flip = sig != 0 and sig != d
+                    if stop_hit or flip:
+                        exitp = p["stop"] if stop_hit else mark
+                        gross = d * p["qty"] * (exitp - p["avg"]); fee = abs(p["qty"] * exitp) * FEE
+                        pnl = gross - fee
+                        acct["cash"] += p["margin"] + pnl; acct["realized"] += pnl; acct["fees"] += fee
+                        reason = "trail_stop" if stop_hit else "trend_flip"
+                        qty_c, avg_c, stop_c, adds_c = p["qty"], p["avg"], p["stop"], p["adds"]
+                        blk = d if reason == "trail_stop" else 0
+                        acct["pos"][a] = _blank_sim(); acct["pos"][a]["block"] = blk   # remove BEFORE equity calc
+                        eq = _sim_equity(acct, snap)
+                        _row(ws, "CLOSE", a, "LONG" if d > 0 else "SHORT", reason, exitp, qty_c,
+                             abs(qty_c * exitp), lev, avg_c, stop_c, adds_c, pnl, acct["realized"],
+                             acct["cash"], eq, "SIM")
+                        _log(f"[SIM] {a} CLOSE {reason} pnl=${pnl:+.2f} -> cash=${acct['cash']:.2f}")
+                        if flip and sig != 0 and acct["cash"] >= BET_USD:
+                            _sim_open(acct, a, sig, lev, mark, why, ws, snap)
+                        continue
+
+                # ---- open when flat ----
+                if p["dir"] == 0 and sig != 0 and sig != p["block"]:
+                    _sim_open(acct, a, sig, lev, mark, why, ws, snap)
+                elif p["dir"] == 0 and sig == p["block"]:
+                    pass  # blocked until the trend flips
+
+            equity = _sim_equity(acct, snap); acct["peak"] = max(acct["peak"], equity)
+            dd = (acct["peak"] - equity) / acct["peak"] if acct["peak"] > 0 else 0.0
+            openn = sum(1 for a in ASSETS if acct["pos"][a]["dir"] != 0)
+            _row(ws, "FORECAST", "-", "-", "sim equity", 0, 0, 0, 0, 0, "", openn, 0.0, acct["realized"],
+                 acct["cash"], equity, f"open {openn}/{len(ASSETS)} dd={dd:.1%} fees=${acct['fees']:.2f}")
+            _log(f"[SIM] equity=${equity:.2f} realized=${acct['realized']:+.2f} free=${acct['cash']:.2f} "
+                 f"open={openn}/{len(ASSETS)} dd={dd:.1%}")
+            if r:
+                try: r.set("trendlive:sim", json.dumps(acct))
+                except Exception: pass
+        except Exception as e:
+            _log(f"sim loop error: {e}")
+        time.sleep(max(60, POLL))
+
+
 def run():
     _log(f"start — LIVE_ENABLED={LIVE_ENABLED} DRY_RUN={bf.DRY_RUN} base={bf.BASE} | {ASSETS} "
          f"bet ${BET_USD}/coin lev {LEV_MIN:.0f}-{LEV_MAX:.0f}x | trail {TRAIL_STOP0:.0%}/BE{TRAIL_BE:.0%} "
@@ -164,6 +295,10 @@ def run():
         bf.load_filters([SYMBOL[a] for a in ASSETS])
     except Exception as e:
         _log(f"filters load failed (will retry in loop): {e}")
+
+    if bf.DRY_RUN:                       # DRY = run the paper simulation (real numbers, no orders)
+        _run_sim(ws, r)
+        return
 
     # per-symbol intended state we own: {dir, adds, stop_px}. Exchange is source of truth for size/entry.
     state = {a: {"dir": 0, "adds": 0, "stop_px": None, "block_dir": 0} for a in ASSETS}

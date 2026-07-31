@@ -4,7 +4,7 @@
 set -euo pipefail
 
 APP=/opt/trend-live
-REPO="${TRENDLIVE_REPO:-https://github.com/MaksymKhl/btc-15m-bot.git}"
+REPO="${TRENDLIVE_REPO:-https://github.com/maxneedsart/Trading.git}"
 
 echo "==> installing python + git"
 apt-get update -y
@@ -29,6 +29,11 @@ echo "==> installing systemd service (auto-restart)"
 cp "$APP/trend-live.service" /etc/systemd/system/trend-live.service
 systemctl daemon-reload
 systemctl enable trend-live
+
+echo "==> installing auto-deploy (server pulls new commits + restarts, every minute)"
+chmod +x "$APP/autodeploy.sh"
+( crontab -l 2>/dev/null | grep -v 'autodeploy.sh' ; echo "* * * * * /opt/trend-live/autodeploy.sh" ) | crontab -
+echo "   auto-deploy on. push from PyCharm -> lands here within ~1 min. log: /var/log/trend-autodeploy.log"
 
 cat <<'DONE'
 
