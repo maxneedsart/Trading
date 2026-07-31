@@ -49,6 +49,7 @@ DAILY_LOSS_STOP = float(os.getenv("LIVE_DAILY_LOSS_STOP", "0.25"))  # halt if eq
 POS_EPS        = float(os.getenv("LIVE_POS_EPS", "0"))             # treat |amt|<=eps as flat (0=exact)
 FEE            = float(os.getenv("LIVE_FEE_RATE", "0.0005"))        # taker fee for the paper simulation
 SIM_START_BAL  = float(os.getenv("LIVE_SIM_BAL", "0"))             # 0 = use the real balance at startup
+REPORT_HOURS   = float(os.getenv("LIVE_REPORT_HOURS", "6"))        # Telegram performance report cadence (0 = off)
 
 # ---- dynamic high-volatility slots (SIM only): pick N daily movers that ALSO pass the trend gate ----
 DYN_SLOTS      = int(os.getenv("LIVE_DYNAMIC_SLOTS", "2"))          # extra coins chosen dynamically (0 = off)
@@ -219,13 +220,43 @@ def _sim_open(acct, a, d, lev, mark, why, ws, snap):
          f"lev={lev:.1f}x stop={stop:.6f} | {why}")
 
 
+def _sim_report(acct, snap):
+    """Build a detailed performance report string for Telegram."""
+    stats = acct.get("stats", {})
+    tot_n = sum(s["n"] for s in stats.values())
+    tot_w = sum(s["w"] for s in stats.values())
+    equity = _sim_equity(acct, snap)
+    start = acct.get("start", equity)
+    ret = (equity / start - 1.0) * 100 if start else 0.0
+    wr = (tot_w / tot_n * 100) if tot_n else 0.0
+    lines = [f"📊 TrendLive SIM — {time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime())}",
+             f"Equity ${equity:.2f}  ({ret:+.1f}% from ${start:.0f})",
+             f"Free ${acct['cash']:.2f} | Realized ${acct['realized']:+.2f} | Fees ${acct.get('fees',0):.2f}",
+             f"Peak ${acct.get('peak',equity):.2f} | DD {((acct.get('peak',equity)-equity)/acct.get('peak',equity)*100 if acct.get('peak',0)>0 else 0):.1f}%",
+             f"Closed trades {tot_n} | Wins {tot_w} ({wr:.0f}%)"]
+    if stats:
+        lines.append("\nПо монетах (угод · W/L · % · P&L):")
+        for a in sorted(stats, key=lambda x: stats[x]["pnl"], reverse=True):
+            s = stats[a]; w = s["w"]; l = s["n"] - w
+            wp = (w / s["n"] * 100) if s["n"] else 0
+            lines.append(f"• {a}: {s['n']}т · {w}W/{l}L · {wp:.0f}% · ${s['pnl']:+.2f}")
+    opens = [(a, p) for a, p in acct["pos"].items() if p["dir"] != 0]
+    if opens:
+        lines.append("\nВідкриті зараз:")
+        for a, p in opens:
+            u = p["dir"] * p["qty"] * (snap[a]["mark"] - p["avg"]) if a in snap else 0.0
+            lines.append(f"• {a} {'LONG' if p['dir']>0 else 'SHORT'} (adds {p['adds']}) unreal ${u:+.2f}")
+    return "\n".join(lines)
+
+
 def _run_sim(ws, r):
     keys = bool(os.getenv("BINANCE_API_KEY"))
     try:
         start = SIM_START_BAL or (bf.usdt_balance() if keys else 30.0) or 30.0
     except Exception:
         start = SIM_START_BAL or 30.0
-    acct = {"cash": start, "realized": 0.0, "fees": 0.0, "peak": start, "pos": {a: _blank_sim() for a in ASSETS}}
+    acct = {"cash": start, "realized": 0.0, "fees": 0.0, "peak": start, "start": start,
+            "stats": {}, "pos": {a: _blank_sim() for a in ASSETS}}
     if r:
         try:
             saved = json.loads(r.get("trendlive:sim") or "{}")
@@ -235,11 +266,12 @@ def _run_sim(ws, r):
                     acct["pos"].setdefault(a, _blank_sim())
         except Exception:
             pass
+    acct.setdefault("stats", {}); acct.setdefault("start", acct.get("peak", start))
     _log(f"SIM/paper mode (DRY_RUN) — projected account start ${acct['cash']:.2f}, {ASSETS}. "
          f"No real orders; 'Live Trades' shows the simulated forecast.")
     _tg(f"📊 TrendLive SIM (paper forecast) start ${acct['cash']:.2f} {ASSETS}")
 
-    last_refresh = 0.0
+    last_refresh = 0.0; last_report = 0.0
     while True:
         try:
             snap = {}
@@ -310,6 +342,8 @@ def _run_sim(ws, r):
                         gross = d * p["qty"] * (exitp - p["avg"]); fee = abs(p["qty"] * exitp) * FEE
                         pnl = gross - fee
                         acct["cash"] += p["margin"] + pnl; acct["realized"] += pnl; acct["fees"] += fee
+                        s = acct["stats"].setdefault(a, {"n": 0, "w": 0, "pnl": 0.0})
+                        s["n"] += 1; s["w"] += 1 if pnl > 0 else 0; s["pnl"] += pnl
                         reason = "trail_stop" if stop_hit else "trend_flip"
                         qty_c, avg_c, stop_c, adds_c = p["qty"], p["avg"], p["stop"], p["adds"]
                         blk = d if reason == "trail_stop" else 0
@@ -340,6 +374,8 @@ def _run_sim(ws, r):
             if r:
                 try: r.set("trendlive:sim", json.dumps(acct))
                 except Exception: pass
+            if REPORT_HOURS > 0 and (now - last_report >= REPORT_HOURS * 3600):
+                _tg(_sim_report(acct, snap)); last_report = now
         except Exception as e:
             _log(f"sim loop error: {e}")
         time.sleep(max(60, POLL))
