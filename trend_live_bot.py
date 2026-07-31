@@ -50,6 +50,38 @@ POS_EPS        = float(os.getenv("LIVE_POS_EPS", "0"))             # treat |amt|
 FEE            = float(os.getenv("LIVE_FEE_RATE", "0.0005"))        # taker fee for the paper simulation
 SIM_START_BAL  = float(os.getenv("LIVE_SIM_BAL", "0"))             # 0 = use the real balance at startup
 
+# ---- dynamic high-volatility slots (SIM only): pick N daily movers that ALSO pass the trend gate ----
+DYN_SLOTS      = int(os.getenv("LIVE_DYNAMIC_SLOTS", "2"))          # extra coins chosen dynamically (0 = off)
+DYN_MIN_VOL    = float(os.getenv("LIVE_DYNAMIC_MIN_VOL", "50000000"))  # min 24h quote volume (liquidity)
+DYN_REFRESH_MIN = int(os.getenv("LIVE_DYNAMIC_REFRESH_MIN", "60"))  # re-pick free slots at most this often
+DYN_EXCLUDE    = set(x.strip().upper() for x in
+                     os.getenv("LIVE_DYNAMIC_EXCLUDE", "BTC,ETH,USDC,FDUSD,DAI").split(",") if x.strip())
+
+
+def scan_movers():
+    """Rank liquid USDT-perps by |24h move| (the 'high-margin' movers), excluding the fixed core."""
+    try:
+        data = bf._request("GET", "/fapi/v1/ticker/24hr")
+    except Exception as e:
+        _log(f"scan failed: {e}"); return []
+    rows = []
+    for t in data:
+        s = t.get("symbol", "")
+        if not s.endswith("USDT"):
+            continue
+        base = s[:-4]
+        if base in DYN_EXCLUDE or base in ASSETS:
+            continue
+        try:
+            pct = float(t["priceChangePercent"]); vol = float(t["quoteVolume"])
+        except Exception:
+            continue
+        if vol < DYN_MIN_VOL:
+            continue
+        rows.append((base, pct, vol))
+    rows.sort(key=lambda r: abs(r[1]), reverse=True)
+    return rows
+
 TAB   = os.getenv("LIVE_SHEET_TAB", "Live Trades")
 _HEAD = ["utc", "event", "asset", "side", "reason", "mark", "qty", "notional", "lev", "entry",
          "stop_px", "adds", "unreal", "realized_est", "free_usdt", "equity", "note"]
@@ -162,8 +194,7 @@ def _blank_sim():
 
 def _sim_equity(acct, snap):
     eq = acct["cash"]
-    for a in ASSETS:
-        p = acct["pos"][a]
+    for a, p in acct["pos"].items():
         if p["dir"] != 0 and a in snap:
             eq += p["margin"] + p["dir"] * p["qty"] * (snap[a]["mark"] - p["avg"])
     return eq
@@ -208,10 +239,43 @@ def _run_sim(ws, r):
          f"No real orders; 'Live Trades' shows the simulated forecast.")
     _tg(f"📊 TrendLive SIM (paper forecast) start ${acct['cash']:.2f} {ASSETS}")
 
+    last_refresh = 0.0
     while True:
         try:
             snap = {}
-            for a in ASSETS:
+            now = time.time()
+            # ---- active universe = fixed core (SOL/XRP) + dynamic high-mover slots ----
+            held_dyn = [a for a in list(acct["pos"]) if a not in ASSETS and acct["pos"][a]["dir"] != 0]
+            dyn_active = list(held_dyn)
+            if DYN_SLOTS > 0 and len(dyn_active) < DYN_SLOTS and (now - last_refresh > DYN_REFRESH_MIN * 60):
+                for base, pct, vol in scan_movers():
+                    if len(dyn_active) >= DYN_SLOTS:
+                        break
+                    if base in dyn_active:
+                        continue
+                    try:
+                        c2, _ = tp.daily_closes(base); s2 = tp.signal_and_lev(c2)
+                    except Exception:
+                        continue
+                    if not s2 or s2["dir"] == 0:
+                        continue                                  # must agree with the daily trend
+                    SYMBOL.setdefault(base, f"{base}USDT")
+                    try:
+                        if not bf.filters(SYMBOL[base]):
+                            continue
+                    except Exception:
+                        continue
+                    dyn_active.append(base)
+                    _log(f"[SIM] dynamic pick: {base} (24h {pct:+.1f}%, vol ${vol/1e6:.0f}M, "
+                         f"trend {'up' if s2['dir']>0 else 'down'})")
+                last_refresh = now
+            universe = list(ASSETS) + dyn_active
+            for a in universe:
+                acct["pos"].setdefault(a, _blank_sim()); SYMBOL.setdefault(a, f"{a}USDT")
+            for k in [k for k in list(acct["pos"]) if k not in universe and acct["pos"][k]["dir"] == 0]:
+                del acct["pos"][k]                                # prune flat, de-selected dynamic coins
+
+            for a in universe:
                 try:
                     closes, _ = tp.daily_closes(a); sl = tp.signal_and_lev(closes); mark = bf.mark_price(SYMBOL[a])
                 except Exception as e:
@@ -267,11 +331,12 @@ def _run_sim(ws, r):
 
             equity = _sim_equity(acct, snap); acct["peak"] = max(acct["peak"], equity)
             dd = (acct["peak"] - equity) / acct["peak"] if acct["peak"] > 0 else 0.0
-            openn = sum(1 for a in ASSETS if acct["pos"][a]["dir"] != 0)
+            openn = sum(1 for p in acct["pos"].values() if p["dir"] != 0)
+            held = ",".join(a for a, p in acct["pos"].items() if p["dir"] != 0) or "flat"
             _row(ws, "FORECAST", "-", "-", "sim equity", 0, 0, 0, 0, 0, "", openn, 0.0, acct["realized"],
-                 acct["cash"], equity, f"open {openn}/{len(ASSETS)} dd={dd:.1%} fees=${acct['fees']:.2f}")
+                 acct["cash"], equity, f"open {openn} [{held}] dd={dd:.1%} fees=${acct['fees']:.2f}")
             _log(f"[SIM] equity=${equity:.2f} realized=${acct['realized']:+.2f} free=${acct['cash']:.2f} "
-                 f"open={openn}/{len(ASSETS)} dd={dd:.1%}")
+                 f"open={openn} [{held}] dd={dd:.1%}")
             if r:
                 try: r.set("trendlive:sim", json.dumps(acct))
                 except Exception: pass
