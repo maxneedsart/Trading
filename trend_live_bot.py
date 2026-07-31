@@ -83,6 +83,56 @@ def scan_movers():
     rows.sort(key=lambda r: abs(r[1]), reverse=True)
     return rows
 
+
+# ---- signal mode: "daily" (validated trend basket) or "intraday" (active, DynDCA-like; -EV lab) ----
+MODE = os.getenv("LIVE_MODE", "daily").lower()
+if MODE == "intraday":                       # tighter/faster than the daily defaults
+    TRAIL_STOP0 = float(os.getenv("LIVE_INTRA_STOP0", "0.02"))
+    TRAIL_PCT   = float(os.getenv("LIVE_INTRA_TRAIL", "0.02"))
+    TRAIL_BE    = float(os.getenv("LIVE_INTRA_BE", "0.01"))
+    TRAIL_PYR   = float(os.getenv("LIVE_INTRA_PYR", "0.03"))
+INTRA_INTERVAL  = os.getenv("LIVE_INTRA_INTERVAL", "15m")
+INTRA_LOOKBACKS = [int(x) for x in os.getenv("LIVE_INTRA_LOOKBACKS", "4,12,24").split(",")]  # bars
+INTRA_VOL_LB    = int(os.getenv("LIVE_INTRA_VOL_LB", "20"))
+INTRA_VOL_TGT   = float(os.getenv("LIVE_INTRA_VOL_TARGET", "0.006"))
+
+
+def intraday_signal(base):
+    """Blended momentum on intraday bars (like the trend logic but fast). -EV on its own — lab use."""
+    try:
+        data = bf._request("GET", "/fapi/v1/klines",
+                           {"symbol": f"{base}USDT", "interval": INTRA_INTERVAL,
+                            "limit": max(INTRA_LOOKBACKS) + INTRA_VOL_LB + 2})
+        closes = [float(k[4]) for k in data[:-1]]        # drop the still-forming bar
+    except Exception:
+        return None
+    n = len(closes)
+    if n < max(INTRA_LOOKBACKS) + 1 + INTRA_VOL_LB:
+        return None
+    s = 0; moms = {}; refs = {}
+    for lk in INTRA_LOOKBACKS:
+        ref = closes[-1 - lk]; v = 1 if closes[-1] > ref else -1
+        s += v; moms[lk] = v; refs[lk] = ref
+    d = 1 if s > 0 else (-1 if s < 0 else 0)
+    rets = [closes[i] / closes[i - 1] - 1.0 for i in range(n - INTRA_VOL_LB, n)]
+    m = sum(rets) / len(rets); rv = (sum((x - m) ** 2 for x in rets) / len(rets)) ** 0.5
+    lev = LEV_MIN if rv <= 0 else max(LEV_MIN, min(LEV_MAX, INTRA_VOL_TGT / rv))
+    return {"dir": d, "signal": s, "moms": moms, "refs": refs, "rv": rv, "lev": lev}
+
+
+def _signal(base):
+    if MODE == "intraday":
+        return intraday_signal(base)
+    closes, _ = tp.daily_closes(base)
+    return tp.signal_and_lev(closes)
+
+
+def _why(sl, mark):
+    if MODE == "intraday":
+        ups = sum(1 for v in sl["moms"].values() if v > 0)
+        return f"intraday {ups}/{len(sl['moms'])} up @ {mark:.6f} -> {'LONG' if sl['dir']>0 else 'SHORT'}"
+    return tp.reason_str(sl, mark)
+
 TAB   = os.getenv("LIVE_SHEET_TAB", "Live Trades")
 _HEAD = ["utc", "event", "asset", "side", "reason", "mark", "qty", "notional", "lev", "entry",
          "stop_px", "adds", "unreal", "realized_est", "free_usdt", "equity", "note"]
@@ -267,8 +317,8 @@ def _run_sim(ws, r):
         except Exception:
             pass
     acct.setdefault("stats", {}); acct.setdefault("start", acct.get("peak", start))
-    _log(f"SIM/paper mode (DRY_RUN) — projected account start ${acct['cash']:.2f}, {ASSETS}. "
-         f"No real orders; 'Live Trades' shows the simulated forecast.")
+    _log(f"SIM/paper mode (DRY_RUN) [{MODE}] — projected account start ${acct['cash']:.2f}, {ASSETS} "
+         f"+ {DYN_SLOTS} dynamic. No real orders; 'Live Trades' shows the simulated forecast.")
     _tg(f"📊 TrendLive SIM (paper forecast) start ${acct['cash']:.2f} {ASSETS}")
 
     last_refresh = 0.0; last_report = 0.0
@@ -286,7 +336,7 @@ def _run_sim(ws, r):
                     if base in dyn_active:
                         continue
                     try:
-                        c2, _ = tp.daily_closes(base); s2 = tp.signal_and_lev(c2)
+                        s2 = _signal(base)
                     except Exception:
                         continue
                     if not s2 or s2["dir"] == 0:
@@ -309,13 +359,13 @@ def _run_sim(ws, r):
 
             for a in universe:
                 try:
-                    closes, _ = tp.daily_closes(a); sl = tp.signal_and_lev(closes); mark = bf.mark_price(SYMBOL[a])
+                    sl = _signal(a); mark = bf.mark_price(SYMBOL[a])
                 except Exception as e:
                     _log(f"{a} data error: {e}"); continue
                 if sl is None or not mark:
                     continue
                 snap[a] = {"mark": mark, "sl": sl}
-                sig = sl["dir"]; lev = _clamp_lev(sl["lev"]); why = tp.reason_str(sl, mark)
+                sig = sl["dir"]; lev = _clamp_lev(sl["lev"]); why = _why(sl, mark)
                 p = acct["pos"][a]
 
                 # ---- manage an open sim position ----
