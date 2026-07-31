@@ -1,0 +1,18 @@
+[Unit]
+Description=TrendLive — Binance USDT-M Futures executor (real money, trailing+pyramid)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/trend-live
+EnvironmentFile=/opt/trend-live/.env
+ExecStart=/usr/bin/python3 /opt/trend-live/trend_live_bot.py
+Restart=always
+RestartSec=10
+# don't leak secrets into the journal beyond what the bot itself prints
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
