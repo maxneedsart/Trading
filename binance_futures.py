@@ -161,6 +161,14 @@ def usdt_balance():
     return 0.0
 
 
+def wallet_equity():
+    """True account equity = wallet balance + unrealized PnL (locked margin still counts).
+    Use this for risk checks; usdt_balance() (available) drops when margin is locked and must NOT
+    be used as equity."""
+    d = _request("GET", "/fapi/v2/account", signed=True)
+    return float(d.get("totalMarginBalance") or d.get("totalWalletBalance") or 0.0)
+
+
 def position(symbol):
     """Return {'amt','entry','unreal','leverage'} for a symbol (amt signed: + long / - short)."""
     d = _request("GET", "/fapi/v2/positionRisk", {"symbol": symbol}, signed=True)

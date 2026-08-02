@@ -510,7 +510,7 @@ def run():
     while True:
         try:
             balance = bf.usdt_balance() if os.getenv("BINANCE_API_KEY") else 0.0
-            equity = _equity(balance, {})
+            equity = bf.wallet_equity() if os.getenv("BINANCE_API_KEY") else 0.0   # true equity (incl. locked margin)
 
             # ---- low-funds guard: halt new trades + alert if the Futures wallet is empty ----
             funds_ok = balance >= MIN_BALANCE
