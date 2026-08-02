@@ -138,6 +138,20 @@ def mark_price(symbol):
     return float(d["markPrice"])
 
 
+def book_spread(symbol):
+    """Return (spread_fraction, mid) from best bid/ask, or (None, None). Liquidity/friction gauge."""
+    try:
+        d = _request("GET", "/fapi/v1/ticker/bookTicker", {"symbol": symbol})
+        d = d[0] if isinstance(d, list) else d
+        bid = float(d["bidPrice"]); ask = float(d["askPrice"])
+        if bid <= 0 or ask <= 0:
+            return None, None
+        mid = (bid + ask) / 2.0
+        return (ask - bid) / mid, mid
+    except Exception:
+        return None, None
+
+
 # ---------- account (signed, read-only) ----------
 def usdt_balance():
     d = _request("GET", "/fapi/v2/balance", signed=True)

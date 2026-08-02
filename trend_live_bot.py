@@ -47,9 +47,21 @@ MAX_NOTL_TOTAL = float(os.getenv("LIVE_MAX_NOTIONAL_TOTAL", "80"))  # total expo
 MAX_CONCURRENT = int(os.getenv("LIVE_MAX_CONCURRENT", "2"))
 DAILY_LOSS_STOP = float(os.getenv("LIVE_DAILY_LOSS_STOP", "0.25"))  # halt if equity down 25% vs day start
 POS_EPS        = float(os.getenv("LIVE_POS_EPS", "0"))             # treat |amt|<=eps as flat (0=exact)
+MIN_BALANCE    = float(os.getenv("LIVE_MIN_BALANCE", "3"))         # halt REAL trading + alert if free USDT below this
 FEE            = float(os.getenv("LIVE_FEE_RATE", "0.0005"))        # taker fee for the paper simulation
 SIM_START_BAL  = float(os.getenv("LIVE_SIM_BAL", "0"))             # 0 = use the real balance at startup
 REPORT_HOURS   = float(os.getenv("LIVE_REPORT_HOURS", "6"))        # Telegram performance report cadence (0 = off)
+# ---- friction realism: skip wide-spread coins + charge slippage in the SIM so the forecast is honest ----
+MAX_SPREAD     = float(os.getenv("LIVE_MAX_SPREAD", "0.004"))       # skip entries with spread > 0.4%
+SLIP_ON        = os.getenv("LIVE_SIM_SLIPPAGE", "true").lower() == "true"
+SLIP_EXTRA     = float(os.getenv("LIVE_SIM_SLIP_EXTRA", "0.0002"))  # market-impact on top of half-spread (2 bps)
+
+
+def _slip(spr, notl):
+    """Modeled execution cost of crossing the book on one fill (half-spread + impact)."""
+    if not SLIP_ON:
+        return 0.0
+    return ((spr / 2.0 if spr else 0.0) + SLIP_EXTRA) * abs(notl)
 
 # ---- dynamic high-volatility slots (SIM only): pick N daily movers that ALSO pass the trend gate ----
 DYN_SLOTS      = int(os.getenv("LIVE_DYNAMIC_SLOTS", "2"))          # extra coins chosen dynamically (0 = off)
@@ -152,10 +164,16 @@ def _public_ip():
     return "unknown"
 
 
+TG_TAG    = os.getenv("LIVE_TAG", "").strip()          # "REAL" / "SIM" prefix to separate the two services
+TG_TRADES = os.getenv("LIVE_TG_TRADES", "true").lower() == "true"   # ping on every open/close
+
+
 def _tg(msg):
     tok = os.getenv("TELEGRAM_BOT_TOKEN", ""); chat = os.getenv("TELEGRAM_CHAT_ID", "")
     if not tok or not chat:
         return
+    if TG_TAG:
+        msg = f"[{TG_TAG}] {msg}"
     try:
         from urllib.parse import quote
         from urllib.request import urlopen, Request
@@ -253,14 +271,17 @@ def _sim_equity(acct, snap):
 
 def _sim_open(acct, a, d, lev, mark, why, ws, snap):
     sym = SYMBOL[a]
+    spr = snap.get(a, {}).get("spr")
+    if spr is not None and spr > MAX_SPREAD:                       # too illiquid to trade cheaply
+        _log(f"[SIM] {a} skip: spread {spr*100:.2f}% > max {MAX_SPREAD*100:.1f}%"); return
     target = max(BET_USD * lev, bf.min_notional(sym))
     qty = bf.qty_for_notional(sym, target, mark); notl = qty * mark
     if notl <= 0 or notl < bf.min_notional(sym) or notl > MAX_NOTL_POS:
         _log(f"[SIM] {a} skip size ${notl:.2f}"); return
-    margin = notl / lev; fee = notl * FEE
-    if acct["cash"] < margin + fee:
+    margin = notl / lev; fee = notl * FEE; slip = _slip(spr, notl)
+    if acct["cash"] < margin + fee + slip:
         return
-    acct["cash"] -= (margin + fee); acct["fees"] += fee
+    acct["cash"] -= (margin + fee + slip); acct["fees"] += fee + slip
     sd = _stop_dist(lev); stop = mark * (1 - sd) if d > 0 else mark * (1 + sd)
     acct["pos"][a] = {"dir": d, "qty": qty, "avg": mark, "margin": margin, "stop": stop, "adds": 0, "block": 0}
     eq = _sim_equity(acct, snap)
@@ -268,6 +289,8 @@ def _sim_open(acct, a, d, lev, mark, why, ws, snap):
          acct["realized"], acct["cash"], eq, "SIM")
     _log(f"[SIM] {a} OPEN {'LONG' if d>0 else 'SHORT'} qty={qty} notl=${notl:.2f} stake=${margin:.2f} "
          f"lev={lev:.1f}x stop={stop:.6f} | {why}")
+    if TG_TRADES:
+        _tg(f"🟩 {a} OPEN {'LONG' if d>0 else 'SHORT'} ${notl:.0f} @ {mark:.6g} stop {stop:.6g}")
 
 
 def _sim_report(acct, snap):
@@ -297,6 +320,16 @@ def _sim_report(acct, snap):
             u = p["dir"] * p["qty"] * (snap[a]["mark"] - p["avg"]) if a in snap else 0.0
             lines.append(f"• {a} {'LONG' if p['dir']>0 else 'SHORT'} (adds {p['adds']}) unreal ${u:+.2f}")
     return "\n".join(lines)
+
+
+def _real_report(balance, equity, day_start_eq, state):
+    day_pnl = equity - (day_start_eq if day_start_eq else equity)
+    opens = [f"{a} {'LONG' if state[a]['dir']>0 else 'SHORT'}(a{state[a]['adds']})"
+             for a in ASSETS if state[a]["dir"] != 0]
+    return (f"📊 REAL — {time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime())}\n"
+            f"Equity ${equity:.2f} | Free ${balance:.2f}\n"
+            f"Today P&L ${day_pnl:+.2f}\n"
+            f"Open: {', '.join(opens) or 'flat'}")
 
 
 def _run_sim(ws, r):
@@ -347,9 +380,13 @@ def _run_sim(ws, r):
                             continue
                     except Exception:
                         continue
+                    spr, _ = bf.book_spread(SYMBOL[base])            # skip illiquid wide-spread coins
+                    if spr is not None and spr > MAX_SPREAD:
+                        _log(f"[SIM] skip {base}: spread {spr*100:.2f}% > max {MAX_SPREAD*100:.1f}%")
+                        continue
                     dyn_active.append(base)
                     _log(f"[SIM] dynamic pick: {base} (24h {pct:+.1f}%, vol ${vol/1e6:.0f}M, "
-                         f"trend {'up' if s2['dir']>0 else 'down'})")
+                         f"spread {(spr or 0)*100:.2f}%, trend {'up' if s2['dir']>0 else 'down'})")
                 last_refresh = now
             universe = list(ASSETS) + dyn_active
             for a in universe:
@@ -364,7 +401,8 @@ def _run_sim(ws, r):
                     _log(f"{a} data error: {e}"); continue
                 if sl is None or not mark:
                     continue
-                snap[a] = {"mark": mark, "sl": sl}
+                spr, _ = bf.book_spread(SYMBOL[a])
+                snap[a] = {"mark": mark, "sl": sl, "spr": spr}
                 sig = sl["dir"]; lev = _clamp_lev(sl["lev"]); why = _why(sl, mark)
                 p = acct["pos"][a]
 
@@ -377,11 +415,11 @@ def _run_sim(ws, r):
                     add_notl = BET_USD * TRAIL_ADDF * lev
                     if (p["adds"] < TRAIL_ADDS and fav >= TRAIL_PYR * (p["adds"] + 1) and (sig == 0 or sig == d)
                             and acct["cash"] >= BET_USD * TRAIL_ADDF * (1 + FEE)):
-                        addq = add_notl / mark; fee = add_notl * FEE
+                        addq = add_notl / mark; fee = add_notl * FEE; slip = _slip(snap[a].get("spr"), add_notl)
                         tot = p["qty"] + addq
                         p["avg"] = (p["avg"] * p["qty"] + mark * addq) / tot; p["qty"] = tot
-                        p["margin"] += BET_USD * TRAIL_ADDF; acct["cash"] -= (BET_USD * TRAIL_ADDF + fee)
-                        acct["fees"] += fee; p["adds"] += 1
+                        p["margin"] += BET_USD * TRAIL_ADDF; acct["cash"] -= (BET_USD * TRAIL_ADDF + fee + slip)
+                        acct["fees"] += fee + slip; p["adds"] += 1
                         tr = mark * (1 - TRAIL_PCT) if d > 0 else mark * (1 + TRAIL_PCT)
                         p["stop"] = max(p["stop"], tr) if d > 0 else min(p["stop"], tr)
                         _log(f"[SIM] {a} PYRAMID add#{p['adds']} -> avg {p['avg']:.6f} stop {p['stop']:.6f}")
@@ -390,8 +428,9 @@ def _run_sim(ws, r):
                     if stop_hit or flip:
                         exitp = p["stop"] if stop_hit else mark
                         gross = d * p["qty"] * (exitp - p["avg"]); fee = abs(p["qty"] * exitp) * FEE
-                        pnl = gross - fee
-                        acct["cash"] += p["margin"] + pnl; acct["realized"] += pnl; acct["fees"] += fee
+                        slip = _slip(snap[a].get("spr"), p["qty"] * exitp)
+                        pnl = gross - fee - slip
+                        acct["cash"] += p["margin"] + pnl; acct["realized"] += pnl; acct["fees"] += fee + slip
                         s = acct["stats"].setdefault(a, {"n": 0, "w": 0, "pnl": 0.0})
                         s["n"] += 1; s["w"] += 1 if pnl > 0 else 0; s["pnl"] += pnl
                         reason = "trail_stop" if stop_hit else "trend_flip"
@@ -403,6 +442,8 @@ def _run_sim(ws, r):
                              abs(qty_c * exitp), lev, avg_c, stop_c, adds_c, pnl, acct["realized"],
                              acct["cash"], eq, "SIM")
                         _log(f"[SIM] {a} CLOSE {reason} pnl=${pnl:+.2f} -> cash=${acct['cash']:.2f}")
+                        if TG_TRADES:
+                            _tg(f"{'✅' if pnl>0 else '❌'} {a} CLOSE {reason} pnl=${pnl:+.2f} eq=${eq:.2f}")
                         if flip and sig != 0 and acct["cash"] >= BET_USD:
                             _sim_open(acct, a, sig, lev, mark, why, ws, snap)
                         continue
@@ -462,12 +503,25 @@ def run():
         except Exception:
             pass
 
-    day = time.strftime("%Y-%m-%d", time.gmtime()); day_start_eq = None; halted = False
+    day = time.strftime("%Y-%m-%d", time.gmtime()); day_start_eq = None; halted = False; last_report = 0.0
+    low_funds = False
 
     while True:
         try:
             balance = bf.usdt_balance() if os.getenv("BINANCE_API_KEY") else 0.0
             equity = _equity(balance, {})
+
+            # ---- low-funds guard: halt new trades + alert if the Futures wallet is empty ----
+            funds_ok = balance >= MIN_BALANCE
+            if not funds_ok and not low_funds:
+                low_funds = True
+                _log(f"LOW FUNDS: free ${balance:.2f} < ${MIN_BALANCE:.2f} — halting new REAL trades")
+                _tg(f"🛑 REAL STOPPED — Futures balance ${balance:.2f} below ${MIN_BALANCE:.0f}. "
+                    f"No new trades until you top up the wallet.")
+            elif funds_ok and low_funds:
+                low_funds = False
+                _log(f"funds restored: free ${balance:.2f} — resuming REAL trades")
+                _tg(f"🟢 REAL resumed — balance ${balance:.2f} restored.")
             if day_start_eq is None:
                 day_start_eq = equity or None
             # reset the daily anchor at UTC midnight
@@ -488,14 +542,13 @@ def run():
             for a in ASSETS:
                 sym = SYMBOL[a]
                 try:
-                    closes, _ = tp.daily_closes(a)
-                    sl = tp.signal_and_lev(closes)
+                    sl = _signal(a)                       # mode-aware (daily or intraday)
                     mark = bf.mark_price(sym)
                 except Exception as e:
                     _log(f"{a} data error: {e}"); continue
                 if sl is None or not mark:
                     continue
-                sig = sl["dir"]; lev = _clamp_lev(sl["lev"]); why = tp.reason_str(sl, mark)
+                sig = sl["dir"]; lev = _clamp_lev(sl["lev"]); why = _why(sl, mark)
                 pos = bf.position(sym)
                 amt = pos["amt"]; live_dir = (1 if amt > POS_EPS else (-1 if amt < -POS_EPS else 0))
                 st = state[a]
@@ -559,8 +612,13 @@ def run():
 
                 # ---------- open a new position when flat ----------
                 elif sig != 0 and sig != st["block_dir"]:
+                    if not funds_ok:                                     # low-funds guard: no new entries
+                        continue
                     if open_syms >= MAX_CONCURRENT:
                         continue
+                    spr, _ = bf.book_spread(sym)                          # friction guard: skip wide spreads
+                    if spr is not None and spr > MAX_SPREAD:
+                        _log(f"{a} skip: spread {spr*100:.2f}% > max {MAX_SPREAD*100:.1f}%"); continue
                     lev_c = lev
                     target = max(BET_USD * lev_c, bf.min_notional(sym))   # stake*lev, floored to exchange min
                     qty = bf.qty_for_notional(sym, target, mark)          # ceil-to-step, guaranteed >= min
@@ -598,6 +656,8 @@ def run():
                 except Exception: pass
             _log(f"heartbeat — open {open_syms}/{len(ASSETS)} free=${balance:.2f} equity=${equity:.2f} "
                  f"halted={halted}")
+            if REPORT_HOURS > 0 and (time.time() - last_report >= REPORT_HOURS * 3600):
+                _tg(_real_report(balance, equity, day_start_eq, state)); last_report = time.time()
         except Exception as e:
             _log(f"loop error: {e}")
         time.sleep(max(60, POLL))

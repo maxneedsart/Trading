@@ -31,8 +31,9 @@ systemctl daemon-reload
 systemctl enable trend-live
 
 echo "==> installing auto-deploy (server pulls new commits + restarts, every minute)"
-chmod +x "$APP/autodeploy.sh"
-( crontab -l 2>/dev/null | grep -v 'autodeploy.sh' ; echo "* * * * * /opt/trend-live/autodeploy.sh" ) | crontab -
+chmod +x "$APP/autodeploy.sh" || true
+systemctl enable --now cron 2>/dev/null || true
+( crontab -l 2>/dev/null | grep -v 'autodeploy.sh' || true ; echo "* * * * * /opt/trend-live/autodeploy.sh" ) | crontab - || true
 echo "   auto-deploy on. push from PyCharm -> lands here within ~1 min. log: /var/log/trend-autodeploy.log"
 
 cat <<'DONE'

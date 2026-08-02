@@ -15,7 +15,9 @@ REMOTE="$(git rev-parse "origin/$BRANCH" 2>/dev/null)"
 if [ "$LOCAL" != "$REMOTE" ]; then
     git reset --hard "origin/$BRANCH" >/dev/null 2>&1
     cp "$APP/trend-live.service" /etc/systemd/system/trend-live.service 2>/dev/null || true
+    cp "$APP/trend-real.service" /etc/systemd/system/trend-real.service 2>/dev/null || true
     systemctl daemon-reload
     systemctl restart trend-live
+    systemctl is-enabled trend-real >/dev/null 2>&1 && systemctl restart trend-real || true
     echo "$(date -u '+%Y-%m-%d %H:%M:%S') UTC  deployed $REMOTE" >> /var/log/trend-autodeploy.log
 fi
