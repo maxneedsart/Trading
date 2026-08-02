@@ -49,6 +49,7 @@ DAILY_LOSS_STOP = float(os.getenv("LIVE_DAILY_LOSS_STOP", "0.25"))  # halt if eq
 POS_EPS        = float(os.getenv("LIVE_POS_EPS", "0"))             # treat |amt|<=eps as flat (0=exact)
 MIN_BALANCE    = float(os.getenv("LIVE_MIN_BALANCE", "3"))         # halt REAL trading + alert if free USDT below this
 EXCHANGE_STOP  = os.getenv("LIVE_EXCHANGE_STOP", "false").lower() == "true"  # exchange STOP_MARKET (broken by -4120); off = bot-enforced in-loop stop
+MIN_SIGNAL     = int(os.getenv("LIVE_MIN_SIGNAL", "3"))            # require |aligned lookbacks| >= this to ENTER and to flip-exit (kills whipsaw)
 FEE            = float(os.getenv("LIVE_FEE_RATE", "0.0005"))        # taker fee for the paper simulation
 SIM_START_BAL  = float(os.getenv("LIVE_SIM_BAL", "0"))             # 0 = use the real balance at startup
 REPORT_HOURS   = float(os.getenv("LIVE_REPORT_HOURS", "6"))        # Telegram performance report cadence (0 = off)
@@ -373,8 +374,8 @@ def _run_sim(ws, r):
                         s2 = _signal(base)
                     except Exception:
                         continue
-                    if not s2 or s2["dir"] == 0:
-                        continue                                  # must agree with the daily trend
+                    if not s2 or abs(s2["signal"]) < MIN_SIGNAL:
+                        continue                                  # only full-conviction trend agreement
                     SYMBOL.setdefault(base, f"{base}USDT")
                     try:
                         if not bf.filters(SYMBOL[base]):
@@ -425,7 +426,7 @@ def _run_sim(ws, r):
                         p["stop"] = max(p["stop"], tr) if d > 0 else min(p["stop"], tr)
                         _log(f"[SIM] {a} PYRAMID add#{p['adds']} -> avg {p['avg']:.6f} stop {p['stop']:.6f}")
                     stop_hit = (d > 0 and mark <= p["stop"]) or (d < 0 and mark >= p["stop"])
-                    flip = sig != 0 and sig != d
+                    flip = (sig == -d) and abs(sl["signal"]) >= MIN_SIGNAL   # exit only on a FULL reversal, not noise
                     if stop_hit or flip:
                         exitp = p["stop"] if stop_hit else mark
                         gross = d * p["qty"] * (exitp - p["avg"]); fee = abs(p["qty"] * exitp) * FEE
@@ -450,7 +451,7 @@ def _run_sim(ws, r):
                         continue
 
                 # ---- open when flat ----
-                if p["dir"] == 0 and sig != 0 and sig != p["block"]:
+                if p["dir"] == 0 and sig != 0 and sig != p["block"] and abs(sl["signal"]) >= MIN_SIGNAL:
                     _sim_open(acct, a, sig, lev, mark, why, ws, snap)
                 elif p["dir"] == 0 and sig == p["block"]:
                     pass  # blocked until the trend flips
@@ -612,13 +613,13 @@ def run():
                             st["stop_px"] = max(st["stop_px"], trail) if d > 0 else min(st["stop_px"], trail)
                             _ensure_stop(sym, d, st["stop_px"], ws, a, mark, note=f"pyramid add#{st['adds']}")
                             _tg(f"➕ {a} pyramid add#{st['adds']} @ {mark} stop {st['stop_px']:.6f}")
-                    # trend flip -> close now (stop is the normal exit; this is a backstop)
-                    if sig != 0 and sig != d:
+                    # exit on a FULL reversal only (not marginal signal noise); trailing stop is the primary exit
+                    if (sig == -d) and abs(sl["signal"]) >= MIN_SIGNAL:
                         _flatten(a, ws, balance, equity, "trend_flip")
                         st.update({"dir": 0, "adds": 0, "stop_px": None, "block_dir": d})
 
                 # ---------- open a new position when flat ----------
-                elif sig != 0 and sig != st["block_dir"]:
+                elif sig != 0 and sig != st["block_dir"] and abs(sl["signal"]) >= MIN_SIGNAL:
                     if not funds_ok:                                     # low-funds guard: no new entries
                         continue
                     if open_syms >= MAX_CONCURRENT:
