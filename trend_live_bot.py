@@ -48,6 +48,7 @@ MAX_CONCURRENT = int(os.getenv("LIVE_MAX_CONCURRENT", "2"))
 DAILY_LOSS_STOP = float(os.getenv("LIVE_DAILY_LOSS_STOP", "0.25"))  # halt if equity down 25% vs day start
 POS_EPS        = float(os.getenv("LIVE_POS_EPS", "0"))             # treat |amt|<=eps as flat (0=exact)
 MIN_BALANCE    = float(os.getenv("LIVE_MIN_BALANCE", "3"))         # halt REAL trading + alert if free USDT below this
+EXCHANGE_STOP  = os.getenv("LIVE_EXCHANGE_STOP", "false").lower() == "true"  # exchange STOP_MARKET (broken by -4120); off = bot-enforced in-loop stop
 FEE            = float(os.getenv("LIVE_FEE_RATE", "0.0005"))        # taker fee for the paper simulation
 SIM_START_BAL  = float(os.getenv("LIVE_SIM_BAL", "0"))             # 0 = use the real balance at startup
 REPORT_HOURS   = float(os.getenv("LIVE_REPORT_HOURS", "6"))        # Telegram performance report cadence (0 = off)
@@ -589,6 +590,12 @@ def run():
                         if new_stop != st["stop_px"]:
                             st["stop_px"] = new_stop
                             _ensure_stop(sym, d, new_stop, ws, a, mark, note="ratchet")
+                    # ---- enforce the stop IN-LOOP (protects even if the exchange STOP_MARKET was rejected) ----
+                    if st["stop_px"] and ((d > 0 and mark <= st["stop_px"]) or (d < 0 and mark >= st["stop_px"])):
+                        _log(f"{a} in-loop stop hit @ {mark} (stop {st['stop_px']:.6g}) — market close")
+                        _flatten(a, ws, balance, equity, "trail_stop")
+                        st.update({"dir": 0, "adds": 0, "stop_px": None, "block_dir": d})
+                        continue
                     # pyramid UP (with the trend), respecting caps
                     cur_notl = abs(amt) * mark
                     add_notl = BET_USD * TRAIL_ADDF * lev
@@ -675,7 +682,10 @@ def _total_notional():
 
 
 def _ensure_stop(sym, d, stop_px, ws, asset, mark, note=""):
-    """Replace the exchange-resident stop: cancel existing, place a fresh STOP_MARKET closePosition."""
+    """Optional exchange-resident stop. Binance moved conditional orders to the Algo API (err -4120),
+    so this is OFF by default — the bot enforces the stop IN-LOOP each poll (market close) instead."""
+    if not EXCHANGE_STOP:
+        return
     close_side = "SELL" if d > 0 else "BUY"
     try:
         bf.cancel_all(sym)
