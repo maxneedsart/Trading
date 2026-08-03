@@ -1,0 +1,19 @@
+[Unit]
+Description=TrendReal — Binance USDT-M Futures REAL executor (tiny, liquid core, runs alongside the SIM)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/trend-live
+# shared secrets + base config from .env, then REAL-only overrides from .env.real (later file wins)
+EnvironmentFile=/opt/trend-live/.env
+EnvironmentFile=/opt/trend-live/.env.real
+ExecStart=/usr/bin/python3 /opt/trend-live/trend_live_bot.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
