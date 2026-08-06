@@ -67,14 +67,17 @@ def _slip(spr, notl):
 
 # ---- dynamic high-volatility slots (SIM only): pick N daily movers that ALSO pass the trend gate ----
 DYN_SLOTS      = int(os.getenv("LIVE_DYNAMIC_SLOTS", "2"))          # extra coins chosen dynamically (0 = off)
-DYN_MIN_VOL    = float(os.getenv("LIVE_DYNAMIC_MIN_VOL", "50000000"))  # min 24h quote volume (liquidity)
+DYN_MIN_VOL    = float(os.getenv("LIVE_DYNAMIC_MIN_VOL", "80000000"))  # min 24h quote volume (liquidity)
 DYN_REFRESH_MIN = int(os.getenv("LIVE_DYNAMIC_REFRESH_MIN", "60"))  # re-pick free slots at most this often
+DYN_MIN_MOVE   = float(os.getenv("LIVE_DYNAMIC_MIN_MOVE", "8"))     # only coins moving >= this % (24h) — must be volatile
+DYN_MAX_MOVE   = float(os.getenv("LIVE_DYNAMIC_MAX_MOVE", "60"))    # skip parabolic/exhausted > this % (mean-revert risk)
 DYN_EXCLUDE    = set(x.strip().upper() for x in
-                     os.getenv("LIVE_DYNAMIC_EXCLUDE", "BTC,ETH,USDC,FDUSD,DAI").split(",") if x.strip())
+                     os.getenv("LIVE_DYNAMIC_EXCLUDE", "BTC,ETH,USDC,FDUSD,DAI,USDE,TUSD").split(",") if x.strip())
 
 
 def scan_movers():
-    """Rank liquid USDT-perps by |24h move| (the 'high-margin' movers), excluding the fixed core."""
+    """Smart selection of volatile-but-tradeable movers: liquid, genuinely moving (not flat, not parabolic),
+    excluding the fixed core. Ranked by a momentum×liquidity score. Trend + spread are checked by the caller."""
     try:
         data = bf._request("GET", "/fapi/v1/ticker/24hr")
     except Exception as e:
@@ -91,11 +94,13 @@ def scan_movers():
             pct = float(t["priceChangePercent"]); vol = float(t["quoteVolume"])
         except Exception:
             continue
-        if vol < DYN_MIN_VOL:
-            continue
-        rows.append((base, pct, vol))
-    rows.sort(key=lambda r: abs(r[1]), reverse=True)
-    return rows
+        move = abs(pct)
+        if vol < DYN_MIN_VOL or move < DYN_MIN_MOVE or move > DYN_MAX_MOVE:
+            continue                                    # liquid + volatile + not exhausted
+        score = move * min(vol / DYN_MIN_VOL, 5.0)      # prefer strong movers that are also liquid
+        rows.append((base, pct, vol, score))
+    rows.sort(key=lambda r: r[3], reverse=True)
+    return [(b, p, v) for (b, p, v, _s) in rows]
 
 
 # ---- signal mode: "daily" (validated trend basket) or "intraday" (active, DynDCA-like; -EV lab) ----
@@ -327,7 +332,7 @@ def _sim_report(acct, snap):
 def _real_report(balance, equity, day_start_eq, state):
     day_pnl = equity - (day_start_eq if day_start_eq else equity)
     opens = [f"{a} {'LONG' if state[a]['dir']>0 else 'SHORT'}(a{state[a]['adds']})"
-             for a in ASSETS if state[a]["dir"] != 0]
+             for a in state if state[a]["dir"] != 0]
     return (f"📊 REAL — {time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime())}\n"
             f"Equity ${equity:.2f} | Free ${balance:.2f}\n"
             f"Today P&L ${day_pnl:+.2f}\n"
@@ -506,10 +511,11 @@ def run():
             pass
 
     day = time.strftime("%Y-%m-%d", time.gmtime()); day_start_eq = None; halted = False; last_report = 0.0
-    low_funds = False
+    low_funds = False; dyn_syms = []; last_refresh = 0.0
 
     while True:
         try:
+            now = time.time()
             balance = bf.usdt_balance() if os.getenv("BINANCE_API_KEY") else 0.0
             equity = bf.wallet_equity() if os.getenv("BINANCE_API_KEY") else 0.0   # true equity (incl. locked margin)
 
@@ -531,17 +537,53 @@ def run():
             if today != day:
                 day = today; day_start_eq = equity; halted = False
 
+            # ---- active universe = fixed core + dynamic high-mover slots (REAL) ----
+            held_dyn = [a for a in dyn_syms if a not in ASSETS
+                        and abs(bf.position(SYMBOL.get(a, a + "USDT"))["amt"]) > POS_EPS]
+            dyn_active = list(held_dyn)
+            if (DYN_SLOTS > 0 and len(dyn_active) < DYN_SLOTS and funds_ok and not halted
+                    and (now - last_refresh > DYN_REFRESH_MIN * 60)):
+                for base, pct, vol in scan_movers():
+                    if len(dyn_active) >= DYN_SLOTS:
+                        break
+                    if base in dyn_active or base in ASSETS:
+                        continue
+                    try:
+                        s2 = _signal(base)
+                    except Exception:
+                        continue
+                    if not s2 or abs(s2["signal"]) < MIN_SIGNAL:
+                        continue
+                    SYMBOL.setdefault(base, f"{base}USDT")
+                    try:
+                        if not bf.filters(SYMBOL[base]):
+                            continue
+                    except Exception:
+                        continue
+                    spr, _ = bf.book_spread(SYMBOL[base])
+                    if spr is not None and spr > MAX_SPREAD:
+                        continue
+                    dyn_active.append(base)
+                    _log(f"REAL dynamic pick: {base} (24h {pct:+.0f}%, vol ${vol/1e6:.0f}M, spread {(spr or 0)*100:.2f}%)")
+                    _tg(f"🎯 REAL pick {base} — 24h {pct:+.0f}%, vol ${vol/1e6:.0f}M")
+                last_refresh = now
+            dyn_syms = dyn_active
+            universe = list(ASSETS) + dyn_active
+            for a in universe:
+                state.setdefault(a, {"dir": 0, "adds": 0, "stop_px": None, "block_dir": 0})
+                SYMBOL.setdefault(a, f"{a}USDT")
+
             # ---- daily-loss kill switch ----
             if (day_start_eq and equity <= day_start_eq * (1 - DAILY_LOSS_STOP)) and not halted:
                 halted = True
                 _log(f"DAILY-LOSS STOP hit: equity ${equity:.2f} <= {(1-DAILY_LOSS_STOP):.0%} of day start ${day_start_eq:.2f} — FLATTEN + HALT")
                 _tg(f"🛑 TrendLive DAILY-LOSS STOP — flattening. equity ${equity:.2f}")
-                for a in ASSETS:
+                for a in universe:
                     _flatten(a, ws, balance, equity, "daily_loss")
                     state[a] = {"dir": 0, "adds": 0, "stop_px": None, "block_dir": 0}
 
             open_syms = 0
-            for a in ASSETS:
+            for a in universe:
                 sym = SYMBOL[a]
                 try:
                     sl = _signal(a)                       # mode-aware (daily or intraday)
@@ -662,7 +704,7 @@ def run():
             if r:
                 try: r.set("trendlive:state", json.dumps(state))
                 except Exception: pass
-            _log(f"heartbeat — open {open_syms}/{len(ASSETS)} free=${balance:.2f} equity=${equity:.2f} "
+            _log(f"heartbeat — open {open_syms} (uni {len(universe)}) free=${balance:.2f} equity=${equity:.2f} "
                  f"halted={halted}")
             if REPORT_HOURS > 0 and (time.time() - last_report >= REPORT_HOURS * 3600):
                 _tg(_real_report(balance, equity, day_start_eq, state)); last_report = time.time()
@@ -673,10 +715,11 @@ def run():
 
 def _total_notional():
     tot = 0.0
-    for a in ASSETS:
+    for sym in set(SYMBOL.values()):                 # all known symbols (fixed core + dynamic picks)
         try:
-            p = bf.position(SYMBOL[a]); m = bf.mark_price(SYMBOL[a])
-            tot += abs(p["amt"]) * m
+            p = bf.position(sym)
+            if abs(p["amt"]) > POS_EPS:
+                tot += abs(p["amt"]) * bf.mark_price(sym)
         except Exception:
             pass
     return tot
